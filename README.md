@@ -124,9 +124,42 @@ combined["ocsvm"] = ocsvm.predict(all_X_scaled)
 **Weakness:** The `nu` parameter directly controls the expected fraction of outliers
 in the training data, leading to false positives even on clean baseline.
 
+### 3.4 Elliptic Envelope (Gaussian Covariance)
+
+Fits a robust Gaussian ellipsoid around the baseline data using the Minimum
+Covariance Determinant estimator:
+
+```python
+from sklearn.covariance import EllipticEnvelope
+ee = EllipticEnvelope(contamination=0.02, support_fraction=0.999)
+ee.fit(train_X_scaled)
+combined["elliptic"] = ee.predict(all_X_scaled)
+```
+
+**Strengths:** Principled multivariate Gaussian approach — like a multi-dimensional Z-Score
+that accounts for feature correlations.  
+**Weakness:** Assumes the baseline data is roughly Gaussian. Fails on multi-modal baselines.
+
+### 3.5 Autoencoder (Neural Reconstruction)
+
+A small MLP (32→8→32 bottleneck) is trained to reconstruct baseline features.
+Anomalies produce high reconstruction error because the network only learned normal patterns:
+
+```python
+from sklearn.neural_network import MLPRegressor
+autoencoder = MLPRegressor(hidden_layer_sizes=(32, 8, 32), max_iter=500)
+autoencoder.fit(train_X_scaled, train_X_scaled)  # input == target
+recon_error = np.mean((X - autoencoder.predict(X))**2, axis=1)
+# Flag if error > mean + 3*std of baseline error
+```
+
+**Strengths:** Learns non-linear patterns; scales to high-dimensional data; widely used
+in production anomaly detection systems.  
+**Weakness:** Requires tuning architecture/threshold; non-deterministic training.
+
 ### Why Not Isolation Forest?
 
-Isolation Forest was tested but scored all data identically (anomaly score ≈ −0.46
+Isolation Forest was tested but scored all data identically (anomaly score ~= -0.46
 for both baseline and anomalies). **Root cause:** the baseline has near-zero variance,
 so IF's random tree splits can't differentiate between the tight baseline cluster and
 distant anomaly clusters in this feature space.
@@ -137,33 +170,76 @@ distant anomaly clusters in this feature space.
 
 ```
 ========================================================================
-                Detection Results — Combined Time-Series
+                Detection Results -- Combined Time-Series
 ========================================================================
 Method              Precision     Recall         F1      TP    FP    FN
 ------------------------------------------------------------------------
 Z-Score                 0.987      1.000      0.993     220     3     0
 LOF                     1.000      1.000      1.000     220     0     0
 OC-SVM                  0.827      1.000      0.905     220    46     0
+Elliptic Env.           0.982      1.000      0.991     220     4     0
+Autoencoder             0.853      1.000      0.921     220    38     0
 ========================================================================
 Total: 720 points  |  Normal: 500  |  Anomalous: 220
 ```
 
 ### Key Findings
 
-1. **All methods achieve 100% recall** — every anomaly point was flagged, including
-   the subtle ones. This is because even the "subtle" anomalies (PSS ~20,968 kB) are
-   still ~90× the baseline (PSS ~233 kB).
+1. **All 5 methods achieve 100% recall** -- every anomaly point was flagged, including
+   the subtle ones.
 
-2. **LOF achieves perfect precision** — zero false positives. The density-based approach
+2. **LOF achieves perfect precision** -- zero false positives. The density-based approach
    correctly ignores natural baseline variance.
 
-3. **Z-Score produces 3 false positives** at t=564–566 where baseline PSS dipped to
-   218–219 kB. The baseline mean is ~233 kB with σ ≈ 4.3 kB, so a 15 kB drop gives
-   z = −3.43 to −3.65, barely crossing the |z|>3 threshold. LOF handles this correctly
-   because it evaluates *local density* rather than raw distance from the mean.
+3. **Elliptic Envelope is the runner-up** (F1=0.991, 4 FP) -- its robust Gaussian
+   model catches the same PSS dips as Z-Score plus one additional borderline point.
 
-4. **OC-SVM has 46 false positives** — the tight RBF boundary is overly conservative,
-   flagging natural baseline fluctuations that fall slightly outside the learned boundary.
+4. **Z-Score is third** (F1=0.993, 3 FP) -- the 3 FPs at t=564-566 are caused by
+   baseline PSS dips where z = -3.43 to -3.65.
+
+5. **Autoencoder and OC-SVM have the most false positives** (38 and 46 respectively) --
+   both learn tight boundaries that are overly sensitive to normal baseline variation.
+
+### Per-Window Recall
+
+To verify that all methods catch the *subtle* anomalies (not just the extreme ones):
+
+| Window | Points | Z-Score | LOF | OC-SVM | Elliptic | Autoencoder |
+|--------|--------|---------|-----|--------|----------|-------------|
+| Subtle CPU (1 worker) | 50 | 50/50 | 50/50 | 50/50 | 50/50 | 50/50 |
+| Extreme CPU (4 workers) | 50 | 50/50 | 50/50 | 50/50 | 50/50 | 50/50 |
+| Hard Memory (16 MB) | 60 | 60/60 | 60/60 | 60/60 | 60/60 | 60/60 |
+| Extreme Memory (1 GB) | 60 | 60/60 | 60/60 | 60/60 | 60/60 | 60/60 |
+
+All methods achieve 100% recall on every window, confirming that even the subtlest
+anomalies (PSS ~20k vs baseline ~233) are within detection range for all three approaches.
+
+### Z-Score Threshold Sensitivity
+
+The default z=3.0 produces 3 false positives. We swept thresholds from 1.5 to 10.0
+to find the optimal value:
+
+| Threshold | Precision | Recall | F1 | FP |
+|-----------|-----------|--------|------|------|
+| 1.5 | 0.794 | 1.000 | 0.885 | 57 |
+| 2.0 | 0.924 | 1.000 | 0.961 | 18 |
+| 2.5 | 0.982 | 1.000 | 0.991 | 4 |
+| **3.0** | **0.987** | **1.000** | **0.993** | **3** |
+| 3.5 | 0.991 | 1.000 | 0.995 | 2 |
+| **4.0** | **1.000** | **1.000** | **1.000** | **0** |
+| 5.0–10.0 | 1.000 | 1.000 | 1.000 | 0 |
+
+**Key insight:** At z=4.0, Z-Score achieves **perfect F1=1.000** — zero false positives
+and zero false negatives. The 3 FPs at z=3.0 were caused by baseline PSS dips with
+z-scores of −3.43 to −3.65, which fall below the z=4.0 cutoff. Meanwhile, even the
+subtlest anomaly points have z-scores well above 4.0 (PSS ~20k vs baseline ~233 gives
+z > 4000), so recall is unaffected all the way to z=10.
+
+This demonstrates that **threshold tuning is a simple but effective way to eliminate
+false positives** when the anomaly signal is strong — but it requires knowing the
+anomaly magnitude in advance, which LOF does not.
+
+![Z-Score threshold sensitivity](plot6_zscore_threshold_sensitivity.png)
 
 ---
 
@@ -215,8 +291,12 @@ ALL 6 (baseline)               |      0.993    0 |      1.000    0 |      0.905 
   density changes that threshold-based methods miss.
 
 - **Adding more features doesn't improve LOF** — it's already perfect with 1 feature.
-  However, multi-feature sets improve OC-SVM precision (0.47 → 0.91) by giving the
+  However, multi-feature sets improve OC-SVM precision (0.47 -> 0.91) by giving the
   RBF kernel more dimensions to separate the baseline cluster.
+
+### Ablation Heatmap
+
+![Feature ablation heatmap](plot5_feature_ablation_heatmap.png)
 
 ---
 
@@ -255,24 +335,26 @@ Bar chart comparing Precision, Recall, and F1-Score across the three methods.
 
 ## 7. Discussion & Trade-offs
 
-| Criterion | Z-Score | LOF | OC-SVM |
-|-----------|---------|-----|--------|
-| Precision | ★★☆ (0.99) | ★★★ (1.00) | ★★☆ (0.83) |
-| Recall | ★★★ (1.00) | ★★★ (1.00) | ★★★ (1.00) |
-| F1-Score | ★★★ (0.99) | ★★★ (1.00) | ★★☆ (0.91) |
-| Interpretability | ★★★ | ★★ | ★ |
-| Robustness to baseline variance | ★★ | ★★★ | ★ |
-| Speed | ★★★ | ★★ | ★★ |
+| Criterion | Z-Score | LOF | OC-SVM | Elliptic Env. | Autoencoder |
+|-----------|---------|-----|--------|---------------|-------------|
+| Precision | 0.987 | **1.000** | 0.827 | 0.982 | 0.853 |
+| Recall | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
+| F1-Score | 0.993 | **1.000** | 0.905 | 0.991 | 0.921 |
+| False Positives | 3 | **0** | 46 | 4 | 38 |
+| Interpretability | High | Medium | Low | Medium | Low |
+| Speed | Instant | O(n*k) | O(n) | O(n) | Training req. |
+| Paradigm | Statistical | Density | Boundary | Gaussian Cov. | Neural Recon. |
 
-**LOF is the best overall method** for this task. While all three methods achieve
-perfect recall, LOF is the only one with zero false positives. The Z-Score's 3 FPs
-demonstrate that a hard global threshold (|z|>3) is brittle on low-variance features
-— a 6% PSS dip crosses the threshold because σ ≈ 4.3 kB. LOF avoids this by
-evaluating local density neighborhoods rather than raw distances.
+**Ranking by F1:** LOF (1.000) > Z-Score (0.993) > Elliptic (0.991) > Autoencoder (0.921) > OC-SVM (0.905)
 
-**Recommendation:** In a production monitoring system, use a **two-stage approach** —
-fast Z-Score pre-filter for obvious deviations (catches >99% of anomalies instantly),
-followed by LOF for borderline cases where density context matters.
+**LOF is the best overall method** for this task. Across all 5 methods, LOF is the
+only one with zero false positives. The two Gaussian-family methods (Z-Score and
+Elliptic Envelope) are close behind, while the boundary/reconstruction methods
+(OC-SVM, Autoencoder) suffer from excessive false alarms.
+
+**Recommendation:** In a production monitoring system, use a **two-stage approach** --
+fast Z-Score pre-filter (z=4.0 for zero FPs) for obvious deviations, followed by
+LOF for borderline cases where density context matters.
 
 ---
 
@@ -322,7 +404,9 @@ atlas_test/
 ├── plot1_multifeature_overview.png
 ├── plot2_detection_overlay.png
 ├── plot3_zoomed_windows.png
-└── plot4_method_comparison.png
+├── plot4_method_comparison.png
+├── plot5_feature_ablation_heatmap.png
+└── plot6_zscore_threshold_sensitivity.png
 ```
 
 ---
