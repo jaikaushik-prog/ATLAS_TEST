@@ -167,9 +167,62 @@ Total: 720 points  |  Normal: 500  |  Anomalous: 220
 
 ---
 
-## 5. Visualizations
+## 5. Feature Ablation Study
 
-### 5.1 Multi-Feature Overview
+To understand which prmon variables are most informative, we ran all 3 methods on
+12 different feature subsets. The table shows F1-score and false negatives (FN = missed anomalies):
+
+```
+Feature Set                    | Z-Score F1   FN |     LOF F1   FN |  OC-SVM F1   FN
+----------------------------------------------------------------------------------------------------
+pss only                       |      0.993    0 |      1.000    0 |      0.905    0
+utime only                     |      1.000    0 |      1.000    0 |      0.468    0
+nthreads only                  |      0.370  170 |      1.000    0 |      0.468    0
+swap only                      |      0.000  220 |      0.000  220 |      0.468    0
+rss only                       |      1.000    0 |      1.000    0 |      0.468    0
+pss + utime                    |      0.993    0 |      1.000    0 |      0.905    0
+pss + nthreads                 |      0.993    0 |      1.000    0 |      0.905    0
+utime + nthreads               |      1.000    0 |      1.000    0 |      0.468    0
+pss + utime + nthreads         |      0.993    0 |      1.000    0 |      0.905    0
+memory (pss+rss+vmem+swap)     |      0.993    0 |      1.000    0 |      0.905    0
+I/O (rchar+wchar+rx+tx)        |      1.000    0 |      0.987    0 |      0.954    0
+ALL 6 (baseline)               |      0.993    0 |      1.000    0 |      0.905    0
+```
+
+### Key Observations
+
+- **`utime` is the single most informative feature** — achieves perfect F1=1.000
+  with Z-Score because all anomaly types (CPU and memory stress) generate measurable
+  CPU time. This makes sense: even memory allocations require CPU cycles.
+
+- **`pss` and `rss` are nearly as good** (F1=0.993–1.000) — the PSS jump from ~233 kB
+  to 20,000+ kB is massive enough to trigger detection on all anomaly windows.
+
+- **`nthreads` alone is weak** — Z-Score misses **170 of 220 anomalies** (F1=0.37)
+  because the thread count is a discrete value (1 vs 2/3/5) with very few distinct
+  levels, making z-score thresholds ineffective.
+
+- **`swap` alone is useless** — F1=0.000 for both Z-Score and LOF. Swap activity is
+  sporadic and near-zero for most anomaly points. Even the 1 GB memory burner doesn't
+  consistently trigger swap on a system with sufficient RAM.
+
+- **I/O features detect anomalies unexpectedly well** — `rchar`, `wchar`, `rx_bytes`,
+  `tx_bytes` achieve F1=1.000 with Z-Score because `stress-ng` generates small but
+  measurable I/O and network activity that the idle baseline never produces.
+
+- **LOF is the most robust method** — achieves F1=1.000 on almost every feature set
+  (even `nthreads` alone), demonstrating its ability to detect anomalies from subtle
+  density changes that threshold-based methods miss.
+
+- **Adding more features doesn't improve LOF** — it's already perfect with 1 feature.
+  However, multi-feature sets improve OC-SVM precision (0.47 → 0.91) by giving the
+  RBF kernel more dimensions to separate the baseline cluster.
+
+---
+
+## 6. Visualizations
+
+### 6.1 Multi-Feature Overview
 
 Three features visualized across the combined series. The log-scale PSS (top) makes
 all anomaly windows visible despite their 1000× range difference. The utime panel
@@ -178,21 +231,21 @@ from 1 to 2/5/3/3 in the anomaly segments.
 
 ![Multi-feature overview](plot1_multifeature_overview.png)
 
-### 5.2 Detection Overlay
+### 6.2 Detection Overlay
 
 Per-method flagged anomalies (red dots) overlaid on PSS. Z-Score and LOF flag only
 within the anomaly windows; OC-SVM's red dots extend into baseline segments.
 
 ![Detection overlay](plot2_detection_overlay.png)
 
-### 5.3 Zoomed-In Anomaly Windows
+### 6.3 Zoomed-In Anomaly Windows
 
 Close-up of each window showing PSS and detection flags. Note the different scales:
 subtle CPU has flat PSS ~20k, while extreme memory oscillates up to 1.2M kB.
 
 ![Zoomed windows](plot3_zoomed_windows.png)
 
-### 5.4 Method Comparison
+### 6.4 Method Comparison
 
 Bar chart comparing Precision, Recall, and F1-Score across the three methods.
 
@@ -200,7 +253,7 @@ Bar chart comparing Precision, Recall, and F1-Score across the three methods.
 
 ---
 
-## 6. Discussion & Trade-offs
+## 7. Discussion & Trade-offs
 
 | Criterion | Z-Score | LOF | OC-SVM |
 |-----------|---------|-----|--------|
@@ -223,7 +276,7 @@ followed by LOF for borderline cases where density context matters.
 
 ---
 
-## 7. Conclusions
+## 8. Conclusions
 
 1. **Multivariate novelty detection works well** for prmon data — even a simple
    Z-Score on 6 features achieves F1 > 0.99.
@@ -246,7 +299,7 @@ followed by LOF for borderline cases where density context matters.
 
 ---
 
-## 8. Running
+## 9. Running
 
 ```bash
 pip install pandas numpy matplotlib scikit-learn
